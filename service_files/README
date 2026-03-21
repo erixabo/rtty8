@@ -1,0 +1,14 @@
+/usr/local/bin/rttytx_writer.sh
+/etc/systemd/system/rttytx.service
+
+ezeket service fileokat tedd helyére, utána:
+
+
+sudo chmod +x /usr/local/bin/rttytx_writer.sh
+
+sudo systemctl daemon-reload
+sudo systemctl enable rttytx.service
+sudo systemctl start rttytx.service
+sudo systemctl status rttytx.service
+
+
