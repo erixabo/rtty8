@@ -1,0 +1,12 @@
+[Unit]
+Description=Random interval time and hostname writer to /tmp/rttytx
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/rttytx_writer.sh
+Restart=always
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

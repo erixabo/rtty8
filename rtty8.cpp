@@ -3,30 +3,34 @@
 #include <unistd.h>
 #include <cstring>
 #include <errno.h>
-#include <stdarg.h>
 #include <stdint.h>
 #include <math.h>
-#include <time.h>
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <sys/mman.h>
+#include <sys/select.h>
 #include <librpitx/librpitx.h>
 
 #define byte uint8_t
 
+// Globális paraméterek (az argumentumokból beállítva)
 int MARK = 2125;
 int SPACE = 1955;
 int STOP_BITS = 2;
 int BIT_TIME = 220022;      // default 45.45 baud
 
-ngfmdmasync *fmmod;
-int FifoSize = 10000;
-bool running = true;
+const int FifoSize = 10000;
 
-void playtone(double Frequency, uint32_t Timing) // Timing in 0.1us
+// Jelző a szálbiztos jelkezeléshez
+static volatile sig_atomic_t running = 1;
+static int self_pipe[2];    // pipe a jelkezelő és a select közötti kommunikációhoz
+
+// RTTY adó függvények
+void playtone(double Frequency, uint32_t Timing, ngfmdmasync *fmmod) // Timing in 0.1us
 {
+    if (!fmmod) return;
+
     uint32_t SumTiming = 0;
     SumTiming += Timing % 100;
     if (SumTiming >= 100)
@@ -54,38 +58,37 @@ void playtone(double Frequency, uint32_t Timing) // Timing in 0.1us
     }
 }
 
-void rtty_txbit(bool bit)
+void rtty_txbit(bool bit, ngfmdmasync *fmmod)
 {
     if (running)
     {
         if (bit)
-            playtone(MARK, BIT_TIME);
+            playtone(MARK, BIT_TIME, fmmod);
         else
-            playtone(SPACE, BIT_TIME);
+            playtone(SPACE, BIT_TIME, fmmod);
     }
 }
 
-void rtty_txbyte(byte c)
+void rtty_txbyte(byte c, ngfmdmasync *fmmod)
 {
-    rtty_txbit(0); // start bit
-    // 8 data bits, LSB first (standard for ASCII RTTY)
+    rtty_txbit(0, fmmod); // start bit
     for (int i = 0; i < 8; i++)
-        rtty_txbit((c >> i) & 1);
-    // stop bits
+        rtty_txbit((c >> i) & 1, fmmod);
     for (int i = 0; i < STOP_BITS; i++)
-        rtty_txbit(1);
+        rtty_txbit(1, fmmod);
 }
 
-void send_data(const unsigned char *data, size_t len)
+void send_data(const unsigned char *data, size_t len, ngfmdmasync *fmmod)
 {
     for (size_t i = 0; i < len; i++)
-        rtty_txbyte(data[i]);
+        rtty_txbyte(data[i], fmmod);
 }
 
-static void terminate(int num)
+// Jelkezelő: beállítja a running flaget és ír a pipe‑ba a select feloldásához
+static void signal_handler(int)
 {
-    running = false;
-    fprintf(stderr, "Caught signal - Terminating %x\n", num);
+    running = 0;
+    write(self_pipe[1], "x", 1);   // egy bájt írása a pipe-ba
 }
 
 int main(int argc, char **argv)
@@ -97,7 +100,8 @@ int main(int argc, char **argv)
         printf("  baud       : baud rate (float, default 50)\n");
         printf("  stopbits   : 1 or 2 (default 2)\n");
         printf("  shift      : mark-space shift in Hz (default 170)\n");
-        printf("Then write data to /tmp/rttytx (FIFO) – binary data allowed\n");
+        printf("Reads messages from /tmp/rttytx, waits for STX (0x02) and EOT (0x04)\n");
+        printf("Carrier is on only during transmission.\n");
         exit(0);
     }
 
@@ -125,16 +129,14 @@ int main(int argc, char **argv)
     if (BIT_TIME < 1)
         BIT_TIME = 220022; // fallback
 
-    // Signal handlers
-    for (int i = 0; i < 64; i++)
-    {
-        struct sigaction sa;
-        std::memset(&sa, 0, sizeof(sa));
-        sa.sa_handler = terminate;
-        sigaction(i, &sa, NULL);
-    }
+    // Signal kezelés – csak a SIGINT és SIGTERM
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 
-    // Create FIFO
+    // FIFO létrehozása
     umask(0);
     const char *fifo_path = "/tmp/rttytx";
     unlink(fifo_path);
@@ -143,46 +145,128 @@ int main(int argc, char **argv)
         perror("mkfifo");
         exit(1);
     }
-    printf("FIFO created: %s\n", fifo_path);
-    printf("Waiting for messages... (baud=%.2f, stop=%d, shift=%d Hz)\n", baud_rate, STOP_BITS, shift);
 
-    fmmod = new ngfmdmasync(frequency, 100000, 14, FifoSize);
+    // Self-pipe létrehozása
+    if (pipe(self_pipe) == -1)
+    {
+        perror("pipe");
+        exit(1);
+    }
+
+    printf("FIFO created: %s\n", fifo_path);
+    printf("Waiting for messages (STX...EOT) ... (baud=%.2f, stop=%d, shift=%d Hz)\n",
+           baud_rate, STOP_BITS, shift);
+    printf("Carrier is off until a complete message is received.\n");
+
+    // Állapotgép a FIFO olvasásához
+    enum State { WAIT_STX, COLLECT };
+    State state = WAIT_STX;
+    unsigned char buffer[4096];
+    size_t buf_len = 0;
+
+    int fifo_fd = -1;
+    fd_set readfds;
+    int max_fd;
 
     while (running)
     {
-        int fd = open(fifo_path, O_RDONLY);
-        if (fd == -1)
+        // Ha nincs nyitott FIFO, próbáljuk megnyitni
+        if (fifo_fd < 0)
         {
-            perror("open fifo");
+            fifo_fd = open(fifo_path, O_RDONLY);
+            if (fifo_fd < 0)
+            {
+                perror("open fifo");
+                usleep(1000000);
+                continue;
+            }
+            state = WAIT_STX;
+            buf_len = 0;
+        }
+
+        // select előkészítése
+        FD_ZERO(&readfds);
+        FD_SET(fifo_fd, &readfds);
+        FD_SET(self_pipe[0], &readfds);
+        max_fd = (fifo_fd > self_pipe[0]) ? fifo_fd : self_pipe[0];
+
+        int ret = select(max_fd + 1, &readfds, NULL, NULL, NULL);
+        if (ret < 0)
+        {
+            if (errno == EINTR) continue;  // megszakítás, újrapróbál
+            perror("select");
             break;
         }
 
-        unsigned char buffer[65536];
-        ssize_t bytes_read = read(fd, buffer, sizeof(buffer));
-        close(fd);
-
-        if (bytes_read > 0)
+        // Ha a self-pipe jelez, kilépünk
+        if (FD_ISSET(self_pipe[0], &readfds))
         {
-            printf("Sending %zd bytes\n", bytes_read);
-            send_data(buffer, bytes_read);
-
-            usleep(200000); // allow last samples to leave
-            delete fmmod;
-            fmmod = new ngfmdmasync(frequency, 100000, 14, FifoSize);
-            printf("Message sent, waiting for next...\n");
+            char dummy;
+            read(self_pipe[0], &dummy, 1);
+            break;  // kilépés a ciklusból
         }
-        else if (bytes_read == 0)
+
+        // Ha a FIFO-ban van adat
+        if (FD_ISSET(fifo_fd, &readfds))
         {
-            continue;
-        }
-        else
-        {
-            perror("read");
-            break;
+            unsigned char c;
+            ssize_t n = read(fifo_fd, &c, 1);
+            if (n <= 0)
+            {
+                // FIFO író oldala bezárt (pl. a shell script újraindult)
+                close(fifo_fd);
+                fifo_fd = -1;
+                state = WAIT_STX;
+                buf_len = 0;
+                continue;
+            }
+
+            // Állapotgép feldolgozása
+            switch (state)
+            {
+                case WAIT_STX:
+                    if (c == 0x02)  // STX
+                    {
+                        state = COLLECT;
+                        buf_len = 0;
+                    }
+                    break;
+
+                case COLLECT:
+                    if (c == 0x04)  // EOT
+                    {
+                        if (buf_len > 0)
+                        {
+                            // Vivő bekapcsolása: modulátor létrehozása
+                            ngfmdmasync *fmmod = new ngfmdmasync(frequency, 100000, 14, FifoSize);
+                            printf("Carrier ON, sending %zu bytes\n", buf_len);
+                            send_data(buffer, buf_len, fmmod);
+                            usleep(200000);   // minták kiürülése
+                            delete fmmod;
+                            printf("Carrier OFF, ready for next message\n");
+                        }
+                        state = WAIT_STX;
+                    }
+                    else
+                    {
+                        // Adatgyűjtés
+                        if (buf_len < sizeof(buffer) - 1)
+                            buffer[buf_len++] = c;
+                        else
+                        {
+                            fprintf(stderr, "Message too long, discarding\n");
+                            state = WAIT_STX;
+                        }
+                    }
+                    break;
+            }
         }
     }
 
-    delete fmmod;
+    // Takarítás
+    if (fifo_fd >= 0) close(fifo_fd);
+    close(self_pipe[0]);
+    close(self_pipe[1]);
     unlink(fifo_path);
     return 0;
 }
