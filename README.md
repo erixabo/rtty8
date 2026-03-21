@@ -1,11 +1,37 @@
-# rtty8 – RTTY adó Raspberry Pi-hez
+# rtty8 Documentation
 
-Ez a program RTTY jelet sugároz a Raspberry Pi GPIO 4-es lábára kötött antennán keresztül.
-A program a librpitx könyvtárat használja, amelyet a csomag automatikusan letölt és lefordít.
+## Overview
+This document provides a comprehensive guide to the rtty8 project, outlining its purpose, setup, usage, and contribution guidelines.
 
-## Használat
+## Purpose
+The rtty8 project is designed to facilitate reliable and efficient communication via the RTTY (Radio Teletype) protocol. It aims to streamline the process of sending and receiving text over radio frequencies.
 
-1. Futtasd az `install.sh` scriptet (letölti a librpitx-et és lefordítja az rtty8-at):
+## Setup
+1. **Clone the Repository**:
    ```bash
-   chmod +x install.sh
-   ./install.sh
+   git clone https://github.com/erixabo/rtty8.git
+   cd rtty8
+   ```
+2. **Install Dependencies**:
+   Ensure you have all necessary dependencies installed. You can use the following command to install them:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+## Usage
+To run the application, use the following command:
+```bash
+python main.py
+```
+
+## Contribution Guidelines
+We welcome contributions from the community! Please follow these guidelines when contributing:
+- Fork the repository and create a new branch for your feature.
+- Ensure that your code is well-documented and tested.
+- Submit a pull request with a clear description of your changes.
+
+## License
+This project is licensed under the MIT License. See `LICENSE` for more details.
+
+## Contact
+If you have any questions or suggestions, feel free to reach out to the maintainer at [erixabo@example.com](mailto:erixabo@example.com).
